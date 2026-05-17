@@ -4,15 +4,15 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 
-class Transaction extends Model
+class Notification extends Model
 {
     protected $fillable = [
-        'user_id', 'label', 'amount', 'currency', 'type', 'category', 'date'
+        'user_id', 'type', 'title', 'message', 'read', 'data'
     ];
 
     protected $casts = [
-        'date' => 'date',
-        'amount' => 'decimal:2',
+        'data' => 'array',
+        'read' => 'boolean',
     ];
 
     public function user()

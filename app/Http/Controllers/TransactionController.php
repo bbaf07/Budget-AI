@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Transaction;
+use App\Models\RecurringTransaction;
 use Illuminate\Http\Request;
 use Inertia\Inertia;
 
@@ -10,41 +11,32 @@ class TransactionController extends Controller
 {
     public function index()
     {
-        $transactions = Transaction::where('user_id', auth()->id())
+        $userId = auth()->id();
+
+        $transactions = Transaction::where('user_id', $userId)
             ->orderBy('date', 'desc')
             ->get();
 
-        $revenus  = $transactions->where('type', 'income')->sum('amount');
+        $revenus = $transactions->where('type', 'income')->sum('amount');
         $depenses = $transactions->where('type', 'expense')->sum('amount');
-        $solde    = $revenus - $depenses;
+        $solde = $revenus - $depenses;
 
-        // Données des 6 derniers mois pour les graphiques
         $mois = [];
         for ($i = 5; $i >= 0; $i--) {
-            $date  = now()->subMonths($i);
+            $date = now()->subMonths($i);
             $label = $date->translatedFormat('M Y');
-
-            $rev = Transaction::where('user_id', auth()->id())
-                ->where('type', 'income')
-                ->whereMonth('date', $date->month)
-                ->whereYear('date', $date->year)
-                ->sum('amount');
-
-            $dep = Transaction::where('user_id', auth()->id())
-                ->where('type', 'expense')
-                ->whereMonth('date', $date->month)
-                ->whereYear('date', $date->year)
-                ->sum('amount');
-
+            $rev = Transaction::where('user_id', $userId)->where('type', 'income')
+                ->whereMonth('date', $date->month)->whereYear('date', $date->year)->sum('amount');
+            $dep = Transaction::where('user_id', $userId)->where('type', 'expense')
+                ->whereMonth('date', $date->month)->whereYear('date', $date->year)->sum('amount');
             $mois[] = [
-                'mois'     => $label,
-                'revenus'  => round($rev, 2),
+                'mois' => $label,
+                'revenus' => round($rev, 2),
                 'depenses' => round($dep, 2),
             ];
         }
 
-        // Dépenses par catégorie ce mois
-        $parCategorie = Transaction::where('user_id', auth()->id())
+        $parCategorie = Transaction::where('user_id', $userId)
             ->where('type', 'expense')
             ->whereMonth('date', now()->month)
             ->whereYear('date', now()->year)
@@ -54,113 +46,86 @@ class TransactionController extends Controller
             ->map(fn($total, $cat) => ['name' => $cat, 'value' => $total])
             ->values();
 
+        // Prévision simple : moyenne des 3 derniers mois
+        $previsionRevenus = round(collect($mois)->slice(-3)->avg('revenus'), 2);
+        $previsionDepenses = round(collect($mois)->slice(-3)->avg('depenses'), 2);
+
         return Inertia::render('Dashboard', [
             'transactions' => $transactions,
-            'revenus'      => $revenus,
-            'depenses'     => $depenses,
-            'solde'        => $solde,
-            'parMois'      => $mois,
+            'revenus' => $revenus,
+            'depenses' => $depenses,
+            'solde' => $solde,
+            'parMois' => $mois,
             'parCategorie' => $parCategorie,
+            'prevision' => [
+                'revenus' => $previsionRevenus,
+                'depenses' => $previsionDepenses,
+                'solde' => $previsionRevenus - $previsionDepenses,
+            ],
         ]);
     }
 
     public function store(Request $request)
     {
         $request->validate([
-            'label'    => 'required|string|max:255',
-            'amount'   => 'required|numeric|min:0.01',
-            'type'     => 'required|in:income,expense',
+            'label' => 'required|string|max:255',
+            'amount' => 'required|numeric|min:0.01',
+            'type' => 'required|in:income,expense',
             'category' => 'required|string',
-            'date'     => 'required|date',
+            'date' => 'required|date',
         ]);
 
         Transaction::create([
-            'user_id'  => auth()->id(),
-            'label'    => $request->label,
-            'amount'   => $request->amount,
-            'type'     => $request->type,
+            'user_id' => auth()->id(),
+            'label' => $request->label,
+            'amount' => $request->amount,
+            'type' => $request->type,
             'category' => $request->category,
-            'date'     => $request->date,
+            'date' => $request->date,
         ]);
 
-        return redirect()->back()->with('success', 'Transaction ajoutée !');
+        return redirect()->back();
     }
 
     public function destroy(Transaction $transaction)
     {
-        if ($transaction->user_id !== auth()->id()) {
-            abort(403);
-        }
+        if ($transaction->user_id !== auth()->id()) abort(403);
         $transaction->delete();
-        return redirect()->back()->with('success', 'Transaction supprimée.');
+        return redirect()->back();
     }
 
     public function importCsv(Request $request)
-{
-    $request->validate([
-        'csv_file' => 'required|file|mimes:csv,txt|max:2048',
-    ]);
+    {
+        $request->validate(['csv_file' => 'required|file|mimes:csv,txt|max:2048']);
 
-    $file  = $request->file('csv_file');
-    $lines = array_map('str_getcsv', file($file->getPathname()));
+        $file = $request->file('csv_file');
+        $lines = array_map('str_getcsv', file($file->getPathname()));
+        $header = array_map('strtolower', array_map('trim', $lines[0]));
+        $isHeader = in_array('label', $header) || in_array('libelle', $header) || in_array('montant', $header);
+        $rows = $isHeader ? array_slice($lines, 1) : $lines;
 
-    // Ignore la première ligne si c'est un en-tête
-    $header = array_map('strtolower', array_map('trim', $lines[0]));
-    $isHeader = in_array('label', $header) || in_array('libelle', $header) || in_array('montant', $header);
-    $rows = $isHeader ? array_slice($lines, 1) : $lines;
+        foreach ($rows as $row) {
+            if (count(array_filter($row)) === 0 || count($row) < 4) continue;
 
-    $imported = 0;
-    $errors   = [];
+            $type = strtolower(trim($row[3]));
+            if (in_array($type, ['revenu'])) $type = 'income';
+            if (in_array($type, ['depense', 'dépense'])) $type = 'expense';
+            if (!in_array($type, ['income', 'expense'])) continue;
 
-    foreach ($rows as $i => $row) {
-        // Ignore les lignes vides
-        if (count(array_filter($row)) === 0) continue;
+            try {
+                $dateObj = \Carbon\Carbon::parse(trim($row[0]));
+            } catch (\Exception $e) { continue; }
 
-        // Format attendu : date, label, montant, type, categorie
-        if (count($row) < 4) {
-            $errors[] = "Ligne " . ($i + 2) . " ignorée : pas assez de colonnes.";
-            continue;
+            Transaction::create([
+                'user_id' => auth()->id(),
+                'date' => $dateObj->toDateString(),
+                'label' => trim($row[1]),
+                'amount' => abs(floatval(str_replace(',', '.', trim($row[2])))),
+                'type' => $type,
+                'category' => isset($row[4]) ? trim($row[4]) : 'Autre',
+            ]);
         }
 
-        $date     = trim($row[0]);
-        $label    = trim($row[1]);
-        $amount   = floatval(str_replace(',', '.', trim($row[2])));
-        $type     = strtolower(trim($row[3]));
-        $category = isset($row[4]) ? trim($row[4]) : 'Autre';
-
-        // Valide le type
-        if (!in_array($type, ['income', 'expense', 'revenu', 'depense', 'dépense'])) {
-            $errors[] = "Ligne " . ($i + 2) . " ignorée : type invalide ($type).";
-            continue;
-        }
-
-        // Normalise le type en français
-        if (in_array($type, ['revenu'])) $type = 'income';
-        if (in_array($type, ['depense', 'dépense'])) $type = 'expense';
-
-        // Valide la date
-        try {
-            $dateObj = \Carbon\Carbon::parse($date);
-        } catch (\Exception $e) {
-            $errors[] = "Ligne " . ($i + 2) . " ignorée : date invalide ($date).";
-            continue;
-        }
-
-        Transaction::create([
-            'user_id'  => auth()->id(),
-            'label'    => $label,
-            'amount'   => abs($amount),
-            'type'     => $type,
-            'category' => $category,
-            'date'     => $dateObj->toDateString(),
-        ]);
-
-        $imported++;
+        return redirect()->back();
     }
-
-    return redirect()->back()->with([
-        'success' => "$imported transaction(s) importée(s) avec succès.",
-        'import_errors' => $errors,
-    ]);
-}
 }
